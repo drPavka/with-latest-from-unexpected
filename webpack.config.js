@@ -2,7 +2,7 @@ const path = require('path');
 
 module.exports = {
   watch: true,
-  entry: './src/index.ts',
+  entry: './src/connection.ts',
   module: {
     rules: [
       {
