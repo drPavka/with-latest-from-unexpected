@@ -1,5 +1,5 @@
-import {webSocket, WebSocketSubject} from 'rxjs/webSocket';
-import {BehaviorSubject, concat, from, fromEvent, Observable, Subject, Subscription, timer} from 'rxjs';
+import {webSocket, WebSocketSubject, WebSocketSubjectConfig} from 'rxjs/webSocket';
+import {BehaviorSubject, concat, from, fromEvent, Observable, Observer, Subject, Subscription, timer} from 'rxjs';
 import {
     delayWhen,
     distinctUntilChanged,
@@ -7,7 +7,7 @@ import {
     finalize,
     first,
     map,
-    repeat,
+    repeat, share,
     switchMap,
     takeWhile,
     tap, timeInterval
@@ -21,7 +21,7 @@ export interface IWsMessage<T> {
     info?: string;
 }
 
-const RECONNECTION_INTERVAL = [1, 2, 5, 10, 30, 40, 50, 60];
+const RECONNECTION_INTERVAL = [1, 2, 5, 10, 30/*, 40, 50, 60*/];
 
 class MessageService {
     private index = 0;
@@ -29,62 +29,80 @@ class MessageService {
     private messages$: Observable<IWsMessage<any>> = this.messages$$.asObservable();
     private events$$: Subject<IWsMessage<any>> = new Subject<IWsMessage<any>>();
     public events$: Observable<any> = this.events$$.asObservable();
-    public resetReconnectionTimer$$: Subject<void> = new Subject<void>();
+    public manualConnectionRetry$$: Subject<void> = new Subject<void>();
 
-    private connected = false;
-    private connected$$: BehaviorSubject<boolean> = new BehaviorSubject<boolean>(false);
-    public connected$: Observable<boolean> = this.connected$$.asObservable().pipe(
+    private isConnected = false;
+    private connectionStatus$$: Subject<boolean> = new Subject<boolean>();
+    public connectionStatus$: Observable<boolean> = this.connectionStatus$$.asObservable().pipe(
+        share(),
         distinctUntilChanged(),
+        tap(connected => this.isConnected = connected),
         tap((connected) => {
-            console.log('connected observable %s', connected)
+            console.log('Connection status now: %s ', connected)
         })
     );
-    private subscription: Subscription = new Subscription();
-    private intervalSubscription = new Subscription();
-    private connectingSubscription = new Subscription();
+    private reconnectingSubscription = new Subscription();
     /**
      * connection timeline period
      * @private
      */
-    private connectionInterval$: Observable<number> = concat.apply(
+    private reconnectionInterval$: Observable<number> = concat.apply(
         concat,
         RECONNECTION_INTERVAL.map(_ => timer(_ * 1000))
     ).pipe(
         map((_, index) => RECONNECTION_INTERVAL[index + 1] || 0),
-        //takeWhile(() => !this.connected$),
-        tap((a) => console.log('Connection interval emit %s', a)),
-        tap((period) => {
-            this.connecting$$.next(period)
-        }),
+        tap((a) => console.log('Connection interval emits %s', a)),
     );
-    private webSocket$$: WebSocketSubject<any> = webSocket({
+    private socketConfig: WebSocketSubjectConfig<IWsMessage<unknown>> = {
         url: 'ws://localhost:3000/',
         openObserver: {
             next: () => {
                 console.debug('Connection established');
-                this.connected$$.next(this.connected = true);
-                this.connecting$$.complete();
-                this.connecting = false;
+                this.connectionStatus$$.next(true);
+                this.reconnecting = false;
             }
         },
         closeObserver: {
             next: (event: CloseEvent) => {
                 console.debug('Connection closed, code:', event.code);
-                this.connected$$.next(this.connected = false);
+                this.connectionStatus$$.next(false);
+
             }
         }
-    });
-    private socket$ = this.webSocket$$.asObservable();
+    };
 
-    private connecting = false;
-    private connecting$$: Subject<number> = new Subject<number>();
-    private connecting$: Observable<any> = this.connecting$$.asObservable().pipe(
-        takeWhile(() => !this.connected),
+    private socket$$: WebSocketSubject<any> = webSocket(this.socketConfig);
+    private socket$ = this.socket$$.asObservable();
+    private socketObserver: Observer<IWsMessage<any>> = {
+        next: (response: IWsMessage<any>) => {
+            if (response.msg === 'event') {
+                this.events$$.next(response.data);
+            } else {
+                this.messages$$.next(response);
+            }
+        },
+        error: (e) => {
+            console.info('Socket connection error', e);
+
+            //this.connect();
+        },
+        complete: () => {
+            console.log('Socket connection completed');
+            //this.reconnectingSubscription.unsubscribe();
+        }
+    }
+    private reconnecting = false;
+    //private reconnecting$$: Subject<number> = new Subject<number>();
+    private reconnecting$: Observable<any> = this.reconnectionInterval$.pipe(
+        tap(() => {
+            console.log('reconnecting observable check . isConnected = %s', this.isConnected)
+        }),
+        takeWhile(() => !this.isConnected),
         tap((next) => console.log('Next connection in %s', next))
     );
 
     public send$<T>(msg: string, data: any): Observable<T> {
-        this.webSocket$$.next({
+        this.socket$$.next({
             id: ++this.index,
             msg,
             data
@@ -105,50 +123,61 @@ class MessageService {
     }
 
     public close(): void {
+        this.socket$$.complete();
+    }
+
+    private connect() {
+        console.log('Connect method called. isConnected = %s', this.isConnected)
+        if (!this.isConnected) {
+            console.log('Connect method: subscribing to socket$ observable');
+            this.socket$.subscribe(this.socketObserver);
+        }
 
     }
 
-    private connect(): void {
-        if (!this.connecting) {
-            console.debug('Trying to connect');
-            this.connecting = true;
-            /*            this.resetReconnectionTimer$$.asObservable().subscribe(
-                            () => {
-                                this.connect();
-                            }
-                        );*/
-
-            this.connectionInterval$.subscribe();
-            this.connectingSubscription.add(this.connecting$.pipe(
-                tap(() => {
-                    console.log('connection attempt', this.connected);
-
-                    this.socket$.subscribe({
-                        next: (response: IWsMessage<any>) => {
-                            if (response.msg === 'event') {
-                                this.events$$.next(response.data);
-                            } else {
-                                this.messages$$.next(response);
-                            }
+    private reconnect(): void {
+        if (!this.reconnecting) {
+            console.debug('Trying to reconnect');
+            this.reconnecting = true;
+            this.reconnectingSubscription.add(
+                this.reconnecting$.pipe(
+                    tap(() => {
+                        console.log('reconnection attempt', this.isConnected);
+                        this.connect();
+                    }),
+                ).subscribe(
+                    {
+                        next: () => {
+                            console.log('reconnection attempt in next>subscribe')
                         },
                         error: (e) => {
-                            console.info('Socket connection error', e);
-                            this.connect();
+                            console.log(e, '-------------------------');
+                        },
+                        complete: () => {
+                            console.log('ReConnection finished. Connection status %s', this.isConnected);
                         }
-                    })
-                }),
-            ).subscribe(
-                {
-                    complete: () => {
-                        console.log('Connection completed', this.connected);
                     }
-                }
-            ));
+                ));
         }
     }
 
     constructor() {
         this.connect();
+        this.connectionStatus$.subscribe({
+            next: (connected) => {
+                if (!connected) {
+                    this.reconnect();
+                } else {
+                    console.log('Connected : unsubscribe from reconnection observable and reconnection interval observable');
+                    //this.reconnectingSubscription.unsubscribe();
+                }
+            }
+        });
+        this.manualConnectionRetry$$.asObservable().pipe(
+            tap(() => {
+                this.connect()
+            })
+        ).subscribe();
 
     }
 }
@@ -173,13 +202,18 @@ fromEvent(relogin, 'click').pipe(
         }
     }
 );
-service.connected$.pipe(
+service.connectionStatus$.pipe(
     tap((connected) => {
         (document.getElementById('relogin') as HTMLButtonElement).disabled = !connected;
         (document.getElementById('retry') as HTMLButtonElement).disabled = connected;
+        (document.getElementById('close') as HTMLButtonElement).disabled = !connected;
     })
 ).subscribe();
 
 (document.getElementById('retry') as HTMLButtonElement).addEventListener('click', () => {
-    service.resetReconnectionTimer$$.next()
+    service.manualConnectionRetry$$.next()
+});
+
+(document.getElementById('close') as HTMLButtonElement).addEventListener('click', () => {
+    service.close();
 })
